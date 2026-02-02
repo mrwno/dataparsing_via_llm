@@ -1,0 +1,11 @@
+wandb
+unitxt
+datasets==3.6.0
+transformers
+torch
+accelerate
+sentence-transformers
+seaborn
+ipywidgets
+dspy-ai
+openai
