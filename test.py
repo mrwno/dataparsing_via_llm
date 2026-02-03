@@ -1,22 +1,18 @@
 """End-to-end evaluation pipeline for Unitxt LLM Agent."""
+
 import os
 import sys
+import json
 import pandas as pd
-import wandb
 from unitxt import load_dataset as unitxt_load
 from standardize import load_standardized_dataset
+
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-os.makedirs("results", exist_ok=True)
-WANDB_PROJECT = "unitxt-llm-agent"
-
-# Unitxt internal columns to ignore during evaluation
-EXCLUDED_COLS = {
-    'recipes', 'metrics', 'postprocessors', 'data_classification_policy', 
-    'source', 'split', 'group', 'subset', 'task_data'
-}
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 GLUE_DATASETS = [
     {"card_id": "sst2", "hf_name": "glue", "hf_config": "sst2"},
@@ -26,6 +22,10 @@ GLUE_DATASETS = [
     {"card_id": "wnli", "hf_name": "glue", "hf_config": "wnli"},
 ]
 
+# Fields inside task_data that are Unitxt metadata, not actual data columns
+UNITXT_METADATA_FIELDS = {'metadata', 'data_classification_policy'}
+
+
 def check_api_key():
     """Ensure API key is set before starting expensive tests."""
     if not os.getenv("OPENROUTER_API_KEY"):
@@ -33,20 +33,62 @@ def check_api_key():
         print("   Run: export OPENROUTER_API_KEY='your_key_here'")
         sys.exit(1)
 
-def compute_score(gt_df: pd.DataFrame, pred_df: pd.DataFrame) -> float:
-    """Compare columns overlap (Jaccard Index)."""
-    # 1. Get columns
-    gt_cols = set(gt_df.columns)
-    pred_cols = set(pred_df.columns)
+
+def extract_unitxt_standardized(unitxt_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract clean standardized data from Unitxt's task_data column."""
+    if 'task_data' not in unitxt_df.columns:
+        return pd.DataFrame()
     
-    # 2. Filter out Unitxt internal metadata (starting with _ or in blocklist)
-    gt_cols = {c for c in gt_cols if not c.startswith("_") and c not in EXCLUDED_COLS}
+    rows = []
+    for task_data in unitxt_df['task_data']:
+        # Parse if string
+        if isinstance(task_data, str):
+            task_data = json.loads(task_data)
+        
+        # Filter out metadata fields
+        clean_row = {k: v for k, v in task_data.items() if k not in UNITXT_METADATA_FIELDS}
+        rows.append(clean_row)
     
-    # 3. Compute Jaccard Index
-    intersection = len(gt_cols & pred_cols)
-    union = len(gt_cols | pred_cols)
+    return pd.DataFrame(rows)
+
+
+def extract_task_data_fields(unitxt_df: pd.DataFrame) -> set:
+    """Extract the actual data field names from Unitxt's task_data column."""
+    if 'task_data' not in unitxt_df.columns:
+        return set()
     
+    sample = unitxt_df['task_data'].iloc[0]
+    if isinstance(sample, str):
+        sample = json.loads(sample)
+    
+    return {k for k in sample.keys() if k not in UNITXT_METADATA_FIELDS}
+
+
+def apply_llm_mapping(raw_df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """Apply LLM mapping to raw dataset and return standardized DataFrame."""
+    # Build rename dict: raw_column -> standard_field
+    rename_dict = {
+        v: k for k, v in mapping.items() 
+        if k != "task" and isinstance(v, str) and v in raw_df.columns
+    }
+    
+    # Apply renaming
+    df_standardized = raw_df.rename(columns=rename_dict)
+    
+    # Keep only mapped columns
+    mapped_cols = list(rename_dict.values())
+    if mapped_cols:
+        df_standardized = df_standardized[mapped_cols]
+    
+    return df_standardized
+
+
+def compute_score(gt_fields: set, pred_fields: set) -> float:
+    """Jaccard Index between ground truth and predicted field sets."""
+    intersection = len(gt_fields & pred_fields)
+    union = len(gt_fields | pred_fields)
     return intersection / union if union > 0 else 0.0
+
 
 # ============================================================================
 # MAIN PIPELINE
@@ -54,87 +96,85 @@ def compute_score(gt_df: pd.DataFrame, pred_df: pd.DataFrame) -> float:
 def main():
     check_api_key()
     
-    run = wandb.init(project=WANDB_PROJECT, job_type="eval", name="glue_eval_run_openrouter")
     print(f"Testing on {len(GLUE_DATASETS)} GLUE datasets: {[d['card_id'] for d in GLUE_DATASETS]}")
     
-    table_data = []
+    results = []
 
     for exp in GLUE_DATASETS:
         card_id, hf_name, hf_config = exp["card_id"], exp["hf_name"], exp["hf_config"]
         print(f"\n{'='*40}\nProcessing: {card_id}")
         
         try:
-            # -------------------------------------------------------
-            # Step A: LLM Processing (Agent)
-            # -------------------------------------------------------
-            # This now calls the OpenRouter API via standardize.py
+            # Step A: LLM Processing
             llm_result = load_standardized_dataset(hf_name, config=hf_config)
             mapping = llm_result.get("mapping", {})
             
-            # Optimization: Reuse the dataset object returned by the agent
+            # Get raw dataset and apply LLM standardization
             ds_raw = llm_result.get("dataset")
             if not ds_raw:
                 raise ValueError("Agent failed to return a valid dataset object.")
-                
+            
             df_raw = pd.DataFrame(list(ds_raw.take(50)))
+            df_llm = apply_llm_mapping(df_raw, mapping)
             
-            # Apply LLM renaming logic
-            rename_dict = {
-                v: k for k, v in mapping.items() 
-                if k != "task" and isinstance(v, str) and v in df_raw.columns
-            }
-            df_llm = df_raw.rename(columns=rename_dict)
-            
-            # Keep only the mapped columns for clean comparison
-            mapped_cols = list(rename_dict.values())
-            if mapped_cols:
-                df_llm = df_llm[mapped_cols]
+            # Extract LLM predicted fields
+            llm_fields = {k for k in mapping.keys() if k != "task"}
 
-            # -------------------------------------------------------
             # Step B: Unitxt Ground Truth
-            # -------------------------------------------------------
-            # Load the official Unitxt card output
             recipe = f"card=cards.{card_id}"
             gt_data = unitxt_load(recipe, split="train", streaming=True)
-            df_gt = pd.DataFrame(list(gt_data.take(50)))
+            df_gt_raw = pd.DataFrame(list(gt_data.take(50)))
+            
+            # Extract clean standardized data from task_data
+            df_gt = extract_unitxt_standardized(df_gt_raw)
+            gt_fields = extract_task_data_fields(df_gt_raw)
 
-            # -------------------------------------------------------
             # Step C: Evaluation
-            # -------------------------------------------------------
-            score = compute_score(df_gt, df_llm)
+            score = compute_score(gt_fields, llm_fields)
 
-            # Save artifacts
-            save_path = f"results/{card_id}"
+            # Step D: Save artifacts
+            save_path = f"{RESULTS_DIR}/{card_id}"
             os.makedirs(save_path, exist_ok=True)
-            df_llm.to_csv(f"{save_path}/llm_processed.csv", index=False)
-            df_gt.to_csv(f"{save_path}/unitxt_ground_truth.csv", index=False)
+            
+            df_llm.to_csv(f"{save_path}/llm_standardized.csv", index=False)
+            df_gt.to_csv(f"{save_path}/unitxt_standardized.csv", index=False)
 
-            # Prepare log data
-            llm_cols_str = str(list(df_llm.columns))
-            gt_cols_str = str([c for c in df_gt.columns if c not in EXCLUDED_COLS and not c.startswith("_")])
-
-            wandb.log({
-                "dataset": card_id, 
-                "score": score, 
-                "llm_cols": llm_cols_str, 
-                "gt_cols": gt_cols_str
+            results.append({
+                "dataset": card_id,
+                "score": round(score, 3),
+                "llm_fields": sorted(llm_fields),
+                "gt_fields": sorted(gt_fields),
+                "mapping": json.dumps(mapping),
+                "eval_card": llm_result.get("code", ""),
+                "error": None
             })
             
-            table_data.append([card_id, score, llm_cols_str, gt_cols_str])
             print(f"✅ {card_id} | Score: {score:.3f}")
+            print(f"   LLM: {sorted(llm_fields)}")
+            print(f"   GT:  {sorted(gt_fields)}")
 
         except Exception as e:
             print(f"❌ {card_id} failed: {e}")
-            wandb.log({"dataset": card_id, "score": 0.0, "error": str(e)})
-            table_data.append([card_id, 0.0, "Error", str(e)])
+            results.append({
+                "dataset": card_id,
+                "score": 0.0,
+                "llm_fields": [],
+                "gt_fields": [],
+                "mapping": "{}",
+                "eval_card": "",
+                "error": str(e)
+            })
             continue
 
-    # Summary Table
-    columns = ["Dataset", "Score", "LLM Predicted Columns", "GT Columns"]
-    wandb.log({"evaluation_summary": wandb.Table(data=table_data, columns=columns)})
+    # Save final results
+    df_results = pd.DataFrame(results)
+    output_path = f"{RESULTS_DIR}/evaluation_results.csv"
+    df_results.to_csv(output_path, index=False)
     
-    run.finish()
-    print("\n🎉 Evaluation complete. Check wandb for results.")
+    print(f"\n{'='*40}")
+    print(f"🎉 Evaluation complete. Results saved to: {output_path}")
+    print(df_results[["dataset", "score", "llm_fields", "gt_fields"]].to_string(index=False))
+
 
 if __name__ == "__main__":
     main()
