@@ -13,7 +13,7 @@
 * **Core Framework:** `unitxt` (IBM Research) -> Used for defining "Cards" (dataset mappings) and templates.
 * **Data Handling:** `datasets` (Hugging Face), `pandas`.
 * **LLM Inference:** `transformers` (Local: Gemma-3-270m-it) or API.
-* **Evaluation & Tracking:** `wandb` (Weights & Biases) -> Used for visual comparison of mappings and performance metrics.
+* **Evaluation & Tracking:** Save the result in a Dataframe format and then save it in a CSV file.
 * **Baselines:** `sentence-transformers` (for semantic matching baselines).
 
 ## 3. Core Architecture
@@ -49,6 +49,6 @@ To prove the value of the LLM approach, we must implement `baseline_standardize(
 
 ## 6. Coding Guidelines (@StyleGuide)
 * **Conciseness:** Write ultra-concise, production-ready code. Avoid boilerplate.
-* **No Reinventing:** Always check if `unitxt` or `wandb` has a native function before writing custom logic.
+* **No Reinventing:** Always check if there is an existing library that perform what i ask before writing custom logic.
 * **Error Handling:** The pipeline must be robust. If an LLM/Baseline fails, log the error and skip to the next dataset.
 * **Typing:** Use Python type hints.
