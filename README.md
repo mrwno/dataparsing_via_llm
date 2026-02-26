@@ -30,10 +30,32 @@ export OPENROUTER_API_KEY="your_key_here"
 
 ## Quick Start
 
+### API backend (OpenRouter)
+
+Default model: `anthropic/claude-opus-4.6`
+
 ```python
 from dataset_preprocessing_agent.standardize_api import load_standardized_dataset
 
+# default model
 result = load_standardized_dataset("glue", config="sst2")
+# custom model
+result = load_standardized_dataset("glue", config="sst2", model_id="mistralai/mistral-7b-instruct")
+print(result["mapping"])
+# {"task": "classification", "text": "sentence", "label": "label"}
+```
+
+### Local backend (HuggingFace model)
+
+Default model: `Qwen/Qwen3-0.6B`
+
+```python
+from dataset_preprocessing_agent.standardize_local import load_standardized_dataset_local
+
+# default model
+result = load_standardized_dataset_local("glue", config="sst2")
+# custom model
+result = load_standardized_dataset_local("glue", config="sst2", model_id="Qwen/Qwen2.5-1.5B-Instruct")
 print(result["mapping"])
 # {"task": "classification", "text": "sentence", "label": "label"}
 ```

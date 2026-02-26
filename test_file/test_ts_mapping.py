@@ -23,7 +23,7 @@ from notebooks.module import discover_datasets_ts
 
 def get_raw_columns(hf_name: str, hf_config: str | None) -> set:
     """Load just the feature schema (no data downloaded) via streaming."""
-    from src.standardize_api import _load_split
+    from dataset_preprocessing_agent.standardize_api import _load_split
     try:
         ds = _load_split(hf_name, hf_config)
         return set(ds.features.keys())
