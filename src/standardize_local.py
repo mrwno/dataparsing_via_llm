@@ -14,15 +14,15 @@ def _load_split(name: str, config: str | None) -> object:
     last_err = None
     for split in _FALLBACK_SPLITS:
         try:
-            return load_dataset(name, config, split=split, streaming=True) if config else \
-                   load_dataset(name, split=split, streaming=True)
+            return load_dataset(name, config, split=split, streaming=True, trust_remote_code=True) if config else \
+                   load_dataset(name, split=split, streaming=True, trust_remote_code=True)
         except Exception as e:
             err_str = str(e)
             if config is None and "Config name is missing" in err_str:
                 candidates = [c for c in re.findall(r"'([^']+)'", err_str) if c != name]
                 if candidates:
                     try:
-                        return load_dataset(name, candidates[0], split=split, streaming=True)
+                        return load_dataset(name, candidates[0], split=split, streaming=True, trust_remote_code=True)
                     except Exception as e2:
                         last_err = e2
                 else:
@@ -90,8 +90,8 @@ def _infer_mapping_local(
     column_names = list(features.keys())
 
     system_message = (
-        "You are an expert Data Scientist specializing in the 'Unitxt' library for NLP. "
-        "Your job is to inspect raw dataset samples and deduce the standard Unitxt fields. "
+        "You are an expert Data Scientist. "
+        "Your job is to inspect raw dataset samples and deduce the NLP task and column mapping. "
         "Respond ONLY with a single valid JSON object — no explanation, no markdown."
     )
 
@@ -106,23 +106,15 @@ DATASET METADATA:
 
 YOUR MISSION:
 1. Deduce the NLP task type (e.g. classification, nli, regression, translation, summarization).
-2. Map raw column names to canonical Unitxt fields.
-3. Infer these metadata fields as literal values (not column names):
-   - "<text_col>_type": semantic role of each text column ("sentence", "premise", "hypothesis", "passage", "question", ...).
-   - "classes": JSON array of class label NAMES as strings — never integers. Infer from ClassLabel metadata or sample values.
-   - "type_of_class" (single text) or "type_of_relation" (paired texts): semantic nature of the classification ("sentiment", "entailment", "paraphrase", ...).
-   - "label": raw column name containing the target label.
-4. Return ONLY a valid JSON object — no explanation, no markdown.
+2. Map raw column names to canonical fields.
+3. Return ONLY a valid JSON object — no explanation, no markdown.
 
 OUTPUT FORMAT — choose EXACTLY ONE of the two formats below:
 
-If the task has ONE text column (e.g. classification, generation):
+If the task has ONE text column:
 {{
     "task": "<detected_task_type>",
     "text": "<raw_column_name>",
-    "text_type": "<semantic_type_literal>",
-    "classes": ["<class_name_0>", "<class_name_1>"],
-    "type_of_class": "<sentiment|topic|...>",
     "label": "<raw_column_name_with_label>"
 }}
 
@@ -130,23 +122,14 @@ If the task has TWO text columns (e.g. NLI, similarity):
 {{
     "task": "<detected_task_type>",
     "text_a": "<raw_column_name_1>",
-    "text_a_type": "<semantic_type_literal>",
     "text_b": "<raw_column_name_2>",
-    "text_b_type": "<semantic_type_literal>",
-    "classes": ["<class_name_0>", "<class_name_1>"],
-    "type_of_relation": "<entailment|paraphrase|...>",
     "label": "<raw_column_name_with_label>"
 }}
 
-IMPORTANT: NEVER mix both formats. If you use "text", do NOT add "text_a" or "text_b". If you use "text_a"/"text_b", do NOT add "text".
-
 RULES:
-- Use ONLY the exact key names shown above. NEVER use placeholder names like "chosen_text_field_name".
-- For each text field you include, add a companion "<name>_type" key (e.g. "text_type", "text_a_type") with a literal string describing its semantic role.
-- For paired-text tasks instead of using "type_of_class", use "type_of_relation".
-- "classes" must be a JSON array of the actual human-readable class NAME strings found in the dataset — NEVER use integers or raw label numbers (e.g. use ["positive", "negative"] not ["0", "1"]).
-- All literal annotation values ("classes" items, "type_of_class", "type_of_relation", and any "<name>_type" value) must use spaces, NOT underscores or hyphens (e.g. "not equivalent" not "not_equivalent"). This rule does NOT apply to raw column name references.
-- "label" must be the raw column name (a string), not a class name."""
+- Use ONLY raw column names as values — never class names or literal strings.
+- NEVER mix both formats. If you use "text", do NOT add "text_a" or "text_b".
+- "label" must be the raw column name containing the target label."""
 
     messages = [
         {"role": "system", "content": system_message},

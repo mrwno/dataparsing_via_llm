@@ -10,6 +10,10 @@ from src.standardize_api import load_standardized_dataset
 
 UNITXT_METADATA_FIELDS = {'metadata', 'data_classification_policy'}
 
+# Annotation/metadata fields — ignored when computing the structural score
+def _is_annotation(k: str) -> bool:
+    return k in ("classes", "type_of_class", "type_of_relation") or k.endswith("_type")
+
 
 def extract_unitxt_standardized(unitxt_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -112,77 +116,81 @@ def apply_llm_mapping(raw_df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     return df
 
 
-def compute_score(gt_fields: set, pred_fields: set) -> float:
+def get_gt_raw_columns(df_gt_raw: pd.DataFrame, df_raw: pd.DataFrame, n: int = 10) -> set:
     """
-    Jaccard Index between ground truth and predicted field name sets.
+    Identify which raw HF column names are used as GT by matching Unitxt task_data
+    field values against raw column values.
+
+    Text fields are matched by value-set overlap (n rows). The label field falls
+    back to name-based matching when the raw label is integer-encoded (Unitxt maps
+    it to strings, so value matching fails).
 
     Args:
-        gt_fields: Set of ground truth field names.
-        pred_fields: Set of predicted field names.
+        df_gt_raw: DataFrame from unitxt_load containing a task_data column.
+        df_raw:    DataFrame of the raw HuggingFace dataset.
+        n:         Number of rows to use for value matching.
 
     Returns:
-        Jaccard similarity score between 0.0 and 1.0.
+        Set of raw column names that correspond to GT task_data fields.
     """
-    intersection = len(gt_fields & pred_fields)
-    union = len(gt_fields | pred_fields)
+    if "task_data" not in df_gt_raw.columns or df_raw.empty:
+        return set()
+
+    task_data_rows = []
+    for td in df_gt_raw["task_data"].iloc[:n]:
+        if isinstance(td, str):
+            td = json.loads(td)
+        task_data_rows.append(td)
+    if not task_data_rows:
+        return set()
+
+    gt_fields = [
+        k for k in task_data_rows[0].keys()
+        if k not in UNITXT_METADATA_FIELDS and not _is_annotation(k)
+    ]
+
+    raw_cols = list(df_raw.columns)
+    matched = set()
+    unmatched = []
+
+    for field in gt_fields:
+        gt_vals = {
+            str(row[field])
+            for row in task_data_rows
+            if field in row and row[field] is not None
+        }
+        found = False
+        for col in raw_cols:
+            raw_vals = {str(v) for v in df_raw[col].iloc[:n] if v is not None}
+            # Accept if at least half the GT values appear in the raw column
+            if gt_vals and len(gt_vals & raw_vals) >= max(1, len(gt_vals) // 2):
+                matched.add(col)
+                found = True
+                break
+        if not found:
+            unmatched.append(field)
+
+    # Fallback for label fields whose values were normalized by Unitxt (int → string)
+    _LABEL_NAMES = {"label", "labels", "target", "answer", "class"}
+    for field in unmatched:
+        if field in raw_cols:
+            matched.add(field)
+        elif field in _LABEL_NAMES:
+            for name in _LABEL_NAMES:
+                if name in raw_cols:
+                    matched.add(name)
+                    break
+
+    return matched
+
+
+def _raw_jaccard(gt_cols: set, pred_cols: set) -> float:
+    """Jaccard similarity between two sets of raw column names."""
+    if not gt_cols and not pred_cols:
+        return 1.0
+    intersection = len(gt_cols & pred_cols)
+    union = len(gt_cols | pred_cols)
     return intersection / union if union > 0 else 0.0
-
-
-def compute_annotation_score(df_gt: pd.DataFrame, mapping: dict) -> float:
-    """
-    Compare the VALUES of semantic annotation fields between the prediction
-    and the Unitxt ground truth.
-
-    Annotation fields compared:
-      - "type_of_class", "type_of_relation"
-      - "classes"  (order-insensitive list comparison)
-      - any key ending in "_type"  (e.g. text_type, text_a_type)
-
-    The denominator is the number of annotation fields present in the GT.
-    Fields missing from the prediction mapping are counted as mismatches.
-
-    Args:
-        df_gt: Ground-truth DataFrame produced by extract_unitxt_standardized.
-        mapping: The predicted mapping dict from the standardize function.
-
-    Returns:
-        Fraction of GT annotation fields correctly predicted (0.0–1.0).
-        Returns 1.0 only when GT has no annotation fields to compare.
-    """
-    if df_gt.empty:
-        return 0.0
-
-    gt_row = df_gt.iloc[0].to_dict()
-
-    def _is_annotation(k: str) -> bool:
-        return k in ("type_of_class", "type_of_relation", "classes") or k.endswith("_type")
-
-    # All annotation fields that GT expects
-    gt_annotations = {k: v for k, v in gt_row.items() if _is_annotation(k)}
-
-    if not gt_annotations:
-        return 1.0  # GT has no annotations to compare — no penalty
-
-    matches = 0
-    for k, gt_val in gt_annotations.items():
-        if k not in mapping:
-            continue  # missing from prediction → penalized via denominator
-
-        pred_val = mapping[k]
-
-        if k == "classes":
-            try:
-                gt_list = json.loads(gt_val) if isinstance(gt_val, str) else list(gt_val)
-                pred_list = pred_val if isinstance(pred_val, list) else json.loads(str(pred_val))
-                if sorted(str(x) for x in pred_list) == sorted(str(x) for x in gt_list):
-                    matches += 1
-            except Exception:
-                pass
-        else:
-            if str(pred_val).lower().strip() == str(gt_val).lower().strip():
-                matches += 1
-
-    return matches / len(gt_annotations)
 
 
 def get_raw_columns(hf_name: str, config: str = None) -> set:
@@ -256,8 +264,6 @@ def evaluate(hf_name: str, hf_config: str, card_id: str, save_dir: str | None = 
     df_raw = pd.DataFrame(list(ds_raw.take(n_samples)))
     df_llm = apply_llm_mapping(df_raw, mapping)
 
-    llm_fields = {k for k in mapping.keys() if k != "task"}
-
     recipe = f"card=cards.{card_id},loader_limit={n_samples}"
     df_gt_raw = None
     for _split in ("train", "test", "validation"):
@@ -269,31 +275,31 @@ def evaluate(hf_name: str, hf_config: str, card_id: str, save_dir: str | None = 
             continue
     if df_gt_raw is None:
         raise ValueError(f"No accessible split for Unitxt card {card_id}")
-    
-    
-    gt_fields = extract_task_data_fields(df_gt_raw)
 
-    df_gt = extract_unitxt_standardized(df_gt_raw)
-    struct_score = compute_score(gt_fields, llm_fields)
-    annot_score  = compute_annotation_score(df_gt, mapping)
-    score        = round((struct_score + annot_score) / 2, 3)
+    # GT: raw columns identified by value-matching task_data fields against the raw dataset
+    gt_cols  = get_gt_raw_columns(df_gt_raw, df_raw)
+    # Pred: raw columns referenced in the predicted mapping (non-annotation values)
+    pred_cols = {
+        v for k, v in mapping.items()
+        if k != "task" and not _is_annotation(k) and isinstance(v, str)
+    }
+    struct_score = _raw_jaccard(gt_cols, pred_cols)
+    score        = round(struct_score, 3)
 
     if save_dir:
-        df_llm = apply_llm_mapping(df_raw, mapping)
+        df_gt = extract_unitxt_standardized(df_gt_raw)
         os.makedirs(save_dir, exist_ok=True)
         df_llm.to_csv(f"{save_dir}/llm_standardized.csv", index=False)
         df_gt.to_csv(f"{save_dir}/unitxt_standardized.csv", index=False)
 
     return {
-        "dataset": card_id,
-        "score": score,
+        "dataset":      card_id,
+        "score":        score,
         "struct_score": round(struct_score, 3),
-        "annot_score": round(annot_score, 3),
-        "llm_fields": sorted(llm_fields),
-        "gt_fields": sorted(gt_fields),
-        "mapping": mapping,
-        "eval_card": llm_result.get("code", ""),
-        "df_llm": df_llm,
-        "df_gt": df_gt,
-        "error": None
+        "gt_cols":      sorted(gt_cols),
+        "pred_cols":    sorted(pred_cols),
+        "mapping":      mapping,
+        "eval_card":    llm_result.get("code", ""),
+        "df_llm":       df_llm,
+        "error":        None
     }

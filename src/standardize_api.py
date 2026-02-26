@@ -68,31 +68,28 @@ def _infer_mapping(features: dict, sample_rows: list, instruction: str = None,
 
     YOUR MISSION:
     1. Deduce the NLP task type (e.g. classification, nli, regression, translation, summarization) from the data patterns.
-    2. Map the raw column names to the canonical Unitxt standard fields for that task.
-    3. Infer and include the following metadata fields as literal values (not column names):
-       - "<text_col>_type": the semantic role of each text column (e.g. "sentence", "premise", "hypothesis", "passage", "question").
-       - "classes": a JSON array of class label NAMES as strings — never integers. Infer them from ClassLabel feature metadata or from the actual label values in the samples.
-       - "type_of_class" for single-text tasks, or "type_of_relation" for paired-text tasks: the semantic nature of the classification (e.g. "sentiment", "topic", "entailment", "paraphrase").
-       - "label": the raw column name that contains the target label.
-    4. Return a single valid JSON object.
+    2. Map the raw column names to the canonical standard fields for that task.
+    3. Return a single valid JSON object — no explanation, no markdown.
 
-    OUTPUT FORMAT (all tasks):
+    If the task has ONE text column:
     {{
         "task": "<detected_task_type>",
-        "<your_chosen_name_for_text_col>": "<raw_column_name>",
-        "<your_chosen_name_for_text_col>_type": "<semantic_type_literal>",
-        "classes": ["<class_name_0>", "<class_name_1>"],
-        "type_of_class": "<sentiment|topic|...>",
+        "text": "<raw_column_name>",
+        "label": "<raw_column_name_with_label>"
+    }}
+
+    If the task has TWO text columns (e.g. NLI, similarity, QA):
+    {{
+        "task": "<detected_task_type>",
+        "text_a": "<raw_column_name_1>",
+        "text_b": "<raw_column_name_2>",
         "label": "<raw_column_name_with_label>"
     }}
 
     RULES:
-    - The chosen field names for the text columns must respect the same mapping as Unitxt standard fields.
-    - For each text column you include, add a companion "<name>_type" key with a literal string describing its semantic role.
-    - For paired-text tasks replace "type_of_class" with "type_of_relation".
-    - "classes" must be a JSON array of strings, never integers.
-    - All literal annotation values ("classes" items, "type_of_class", "type_of_relation", and any "<name>_type" value) must use spaces, NOT underscores or hyphens (e.g. "not equivalent" not "not_equivalent", "semantic equivalence" not "semantic-equivalence", "sentence pair" not "sentence_pair"). This rule does NOT apply to raw column name references.
-    - "label" must be the raw column name (a string), not a class name.
+    - Use ONLY raw column names as values — never class names or literal strings.
+    - "label" must be the raw column name containing the target label.
+    - NEVER mix both formats: if you use "text", do NOT add "text_a" or "text_b".
     """
 
     # Only Claude and OpenAI models reliably support json_object format
@@ -161,8 +158,8 @@ def _load_split(name: str, config: str | None) -> object:
     last_err = None
     for split in _FALLBACK_SPLITS:
         try:
-            return load_dataset(name, config, split=split, streaming=True) if config else \
-                   load_dataset(name, split=split, streaming=True)
+            return load_dataset(name, config, split=split, streaming=True, trust_remote_code=True) if config else \
+                   load_dataset(name, split=split, streaming=True, trust_remote_code=True)
         except Exception as e:
             err_str = str(e)
             if config is None and "Config name is missing" in err_str:
@@ -170,7 +167,7 @@ def _load_split(name: str, config: str | None) -> object:
                 candidates = [c for c in re.findall(r"'([^']+)'", err_str) if c != name]
                 if candidates:
                     try:
-                        return load_dataset(name, candidates[0], split=split, streaming=True)
+                        return load_dataset(name, candidates[0], split=split, streaming=True, trust_remote_code=True)
                     except Exception as e2:
                         last_err = e2
                 else:

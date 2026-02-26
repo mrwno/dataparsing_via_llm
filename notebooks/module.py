@@ -1,5 +1,6 @@
 """Experiment helpers: dataset config, evaluation loop, tables, and plots."""
 import os
+import sys
 import json
 import pandas as pd
 import seaborn as sns
@@ -9,6 +10,7 @@ import logging
 import warnings
 from functools import partial
 from src.eval import evaluate
+from src.eval_ts import evaluate_ts
 from src.baselines import baseline_keyword_match, baseline_embedding_match
 from src.standardize_api import load_standardized_dataset
 from src.standardize_local import load_standardized_dataset_local
@@ -168,11 +170,10 @@ def run_evaluation(datasets: list = None, methods: dict = None) -> pd.DataFrame:
                 )
                 score        = result["score"]
                 struct_score = result["struct_score"]
-                annot_score  = result["annot_score"]
                 print(f"Mapping: {result['mapping']}")
-                print(f"  score={score:.3f}  struct={struct_score:.3f}  annot={annot_score:.3f}")
+                print(f"  score={score:.3f}  struct={struct_score:.3f}")
             except Exception as e:
-                score = struct_score = annot_score = None
+                score = struct_score = None
                 print(f"ERROR: {e}")
 
             rows.append({
@@ -180,7 +181,91 @@ def run_evaluation(datasets: list = None, methods: dict = None) -> pd.DataFrame:
                 "method":       method_name,
                 "score":        score,
                 "struct_score": struct_score,
-                "annot_score":  annot_score,
+            })
+
+    print("\nEvaluation complete.")
+    return pd.DataFrame(rows)
+
+
+# ── Tasksource discovery & evaluation ─────────────────────────────────────────
+
+def discover_datasets_ts(task_types: list = None) -> list[dict]:
+    """
+    Discover datasets from the tasksource catalog via list_tasks().
+
+    Args:
+        task_types: Subset of ["Classification", "MultipleChoice",
+                    "TokenClassification"]. Defaults to Classification only.
+
+    Returns:
+        List of dicts with keys: id, hf_name, hf_config, task_type,
+        preprocessing (the tasksource Preprocessing object used as GT).
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    from tasksource.access import list_tasks
+
+    task_types = task_types or ["Classification"]
+    df = list_tasks()
+    df = df[df.task_type.isin(task_types)]
+
+    results = []
+    for _, row in df.iterrows():
+        results.append({
+            "id":           row["id"],
+            "hf_name":      row["dataset_name"],
+            "hf_config":    row["config_name"] if pd.notna(row["config_name"]) else None,
+            "task_type":    row["task_type"],
+            "preprocessing": row["mapping"],
+        })
+    return results
+
+
+def run_evaluation_ts(datasets: list = None, methods: dict = None) -> pd.DataFrame:
+    """
+    Run all (dataset, method) combinations using tasksource as ground truth.
+
+    Args:
+        datasets: List of dicts from discover_datasets_ts().
+        methods:  Dict of {name: standardize_fn} (default: METHODS).
+
+    Returns:
+        DataFrame with columns: dataset, method, score, struct_score.
+    """
+    datasets = datasets or []
+    methods  = methods  or METHODS
+
+    print(f"{len(datasets)} datasets  x  {len(methods)} methods  =  {len(datasets) * len(methods)} evaluations\n")
+
+    rows = []
+    for exp in datasets:
+        ts_id         = exp["id"]
+        hf_name       = exp["hf_name"]
+        hf_config     = exp["hf_config"]
+        preprocessing = exp["preprocessing"]
+        print(f"── {ts_id} ──")
+
+        for method_name, standardize_fn in methods.items():
+            print(f"  {method_name}...", end=" ", flush=True)
+            try:
+                result = evaluate_ts(
+                    hf_name=hf_name,
+                    hf_config=hf_config,
+                    preprocessing=preprocessing,
+                    standardize_fn=standardize_fn,
+                )
+                score        = result["score"]
+                struct_score = result["struct_score"]
+                print(f"Mapping: {result['mapping']}")
+                print(f"  score={score:.3f}  struct={struct_score:.3f}")
+            except Exception as e:
+                score = struct_score = None
+                print(f"ERROR: {e}")
+
+            rows.append({
+                "dataset":      ts_id,
+                "method":       method_name,
+                "score":        score,
+                "struct_score": struct_score,
             })
 
     print("\nEvaluation complete.")
@@ -201,14 +286,10 @@ def make_pivot(df_results: pd.DataFrame, score_col: str) -> pd.DataFrame:
 
 
 def show_tables(df_results: pd.DataFrame) -> None:
-    """Print all three pivot tables (combined, structural, annotation)."""
+    """Print the structural score pivot table."""
     from IPython.display import display
-    print("=== Combined score  (struct + annot) / 2 ===")
+    print("=== Structural score  (Jaccard on field names, annotations excluded) ===")
     display(make_pivot(df_results, "score"))
-    print("\n=== Structural score  (Jaccard on field names) ===")
-    display(make_pivot(df_results, "struct_score"))
-    print("\n=== Annotation score  (*_type / type_of_* / classes) ===")
-    display(make_pivot(df_results, "annot_score"))
 
 
 # ── Visualization ─────────────────────────────────────────────────────────────
@@ -220,33 +301,26 @@ def plot_results(df_results: pd.DataFrame, save_dir: str = "../results") -> None
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    pivot_combined = make_pivot(df_results, "score").drop(index="Average").astype(float)
-    pivot_struct   = make_pivot(df_results, "struct_score").drop(index="Average").astype(float)
-    pivot_annot    = make_pivot(df_results, "annot_score").drop(index="Average").astype(float)
-    avg_combined   = make_pivot(df_results, "score").loc["Average"].astype(float)
+    pivot_score  = make_pivot(df_results, "score").drop(index="Average").astype(float)
+    avg_score    = make_pivot(df_results, "score").loc["Average"].astype(float)
 
     heatmap_cfg = dict(annot=True, fmt=".2f", cmap="YlGn", vmin=0, vmax=1,
                        linewidths=0.5, linecolor="white")
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
-    for ax, data, title in [
-        (axes[0], pivot_combined, "Combined score  (struct + annot) / 2"),
-        (axes[1], pivot_struct,   "Structural score  (Jaccard on field names)"),
-        (axes[2], pivot_annot,    "Annotation score  (*_type / type_of_* / classes)"),
-    ]:
-        sns.heatmap(data, ax=ax, **heatmap_cfg)
-        ax.set_title(title, fontsize=11)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        ax.tick_params(axis="x", rotation=30)
+    fig, ax = plt.subplots(figsize=(10, max(4, len(pivot_score) * 0.4)))
+    sns.heatmap(pivot_score, ax=ax, **heatmap_cfg)
+    ax.set_title("Structural score  (Jaccard on raw column names)", fontsize=11)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.tick_params(axis="x", rotation=30)
     plt.tight_layout()
     plt.savefig(f"{save_dir}/comparison_heatmaps.png", dpi=150, bbox_inches="tight")
     plt.show()
 
     fig2, ax2 = plt.subplots(figsize=(7, 4))
-    colors = sns.color_palette("Set2", len(avg_combined))
-    bars = ax2.bar(avg_combined.index, avg_combined.values, color=colors, edgecolor="black", width=0.5)
-    ax2.set_title("Average combined score per method", fontsize=12)
+    colors = sns.color_palette("Set2", len(avg_score))
+    bars = ax2.bar(avg_score.index, avg_score.values, color=colors, edgecolor="black", width=0.5)
+    ax2.set_title("Average structural score per method", fontsize=12)
     ax2.set_ylim(0, 1.1)
     ax2.set_ylabel("Score")
     ax2.tick_params(axis="x", rotation=30)
